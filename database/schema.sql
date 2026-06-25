@@ -39,6 +39,7 @@ CREATE TABLE loans (
     book_id INT NOT NULL,
     member_id INT NOT NULL,
     book_type VARCHAR(80) NOT NULL DEFAULT 'General',
+    copy_count INT NOT NULL DEFAULT 1,
     borrower_type ENUM('teacher', 'student') NOT NULL DEFAULT 'student',
     borrower_name VARCHAR(160) NULL,
     student_class VARCHAR(20) NULL,

@@ -11,6 +11,7 @@ session_start();
 require __DIR__ . '/config.php';
 
 $action = $_GET['action'] ?? 'dashboard';
+const PROTECTED_ADMIN_EMAIL = 'oderoelijah38@gmail.com';
 
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
@@ -49,8 +50,11 @@ function ensure_app_schema(): void
     if (!isset($columns['loans']['book_type'])) {
         db()->exec("ALTER TABLE loans ADD book_type VARCHAR(80) NOT NULL DEFAULT 'General' AFTER member_id");
     }
+    if (!isset($columns['loans']['copy_count'])) {
+        db()->exec('ALTER TABLE loans ADD copy_count INT NOT NULL DEFAULT 1 AFTER book_type');
+    }
     if (!isset($columns['loans']['borrower_type'])) {
-        db()->exec("ALTER TABLE loans ADD borrower_type ENUM('teacher', 'student') NOT NULL DEFAULT 'student' AFTER book_type");
+        db()->exec("ALTER TABLE loans ADD borrower_type ENUM('teacher', 'student') NOT NULL DEFAULT 'student' AFTER copy_count");
     }
     if (!isset($columns['loans']['borrower_name'])) {
         db()->exec('ALTER TABLE loans ADD borrower_name VARCHAR(160) NULL AFTER borrower_type');
@@ -145,6 +149,7 @@ function issue_book_from_post(string $redirectTo = '?action=issue'): void
     $studentClass = $borrowerType === 'student' ? post('student_class') : '';
     $studentStream = $borrowerType === 'student' ? post('student_stream') : '';
     $bookType = post('book_type') ?: 'General';
+    $copyCount = max(1, (int) post('copy_count', '1'));
     $issueDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', post('issue_date')) ? post('issue_date') : date('Y-m-d');
     $borrowingPeriod = max(1, (int) post('borrowing_period', setting('loan_days', '14')));
     $notes = post('notes');
@@ -165,9 +170,9 @@ function issue_book_from_post(string $redirectTo = '?action=issue'): void
     $book = db()->prepare('SELECT * FROM books WHERE id = ? FOR UPDATE');
     $book->execute([$bookId]);
     $book = $book->fetch();
-    if (!$book || (int) $book['available_copies'] < 1) {
+    if (!$book || (int) $book['available_copies'] < $copyCount) {
         db()->rollBack();
-        flash('Selected book is not available.', 'error');
+        flash('Not enough available copies for this issue.', 'error');
         redirect($redirectTo);
     }
 
@@ -175,9 +180,9 @@ function issue_book_from_post(string $redirectTo = '?action=issue'): void
         ->execute([$memberNo, $borrowerName]);
     $memberId = (int) db()->lastInsertId();
 
-    $stmt = db()->prepare("INSERT INTO loans (book_id, member_id, issued_by, issue_date, due_date, book_type, borrower_type, borrower_name, student_class, student_stream, borrowing_period, notes, activity_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')");
-    $stmt->execute([$bookId, $memberId, current_user()['id'], $issueDate, $dueDate, $bookType, $borrowerType, $borrowerName, $studentClass ?: null, $studentStream ?: null, $borrowingPeriod, $notes]);
-    db()->prepare('UPDATE books SET available_copies = available_copies - 1 WHERE id = ?')->execute([$bookId]);
+    $stmt = db()->prepare("INSERT INTO loans (book_id, member_id, issued_by, issue_date, due_date, book_type, copy_count, borrower_type, borrower_name, student_class, student_stream, borrowing_period, notes, activity_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')");
+    $stmt->execute([$bookId, $memberId, current_user()['id'], $issueDate, $dueDate, $bookType, $copyCount, $borrowerType, $borrowerName, $studentClass ?: null, $studentStream ?: null, $borrowingPeriod, $notes]);
+    db()->prepare('UPDATE books SET available_copies = available_copies - ? WHERE id = ?')->execute([$copyCount, $bookId]);
     db()->commit();
 
     flash('Book issued successfully.');
@@ -246,8 +251,55 @@ function nav_item(string $href, string $label, string $icon, ?int $badge = null)
     return compact('href', 'label', 'icon', 'badge');
 }
 
+function is_protected_admin(array $user): bool
+{
+    return strtolower((string) ($user['email'] ?? '')) === PROTECTED_ADMIN_EMAIL && ($user['role'] ?? '') === 'admin';
+}
+
 function save_book_from_post(): void
 {
+    $formType = post('form_type', 'add_book');
+    if ($formType === 'edit_book') {
+        $bookId = (int) post('book_id');
+        $totalCopies = max(1, (int) post('total_copies', '1'));
+        $isbn = post('isbn') ?: null;
+
+        if ($isbn !== null) {
+            $existing = db()->prepare('SELECT id FROM books WHERE isbn = ? AND id <> ?');
+            $existing->execute([$isbn, $bookId]);
+            if ($existing->fetchColumn()) {
+                flash('Another book already uses this ISBN.', 'error');
+                redirect('?action=books');
+            }
+        }
+
+        $borrowedStmt = db()->prepare("SELECT COALESCE(SUM(copy_count), 0) FROM loans WHERE book_id = ? AND status IN ('borrowed', 'overdue')");
+        $borrowedStmt->execute([$bookId]);
+        $borrowed = (int) $borrowedStmt->fetchColumn();
+        if ($totalCopies < $borrowed) {
+            flash('Total copies cannot be lower than the number currently borrowed.', 'error');
+            redirect('?action=books');
+        }
+
+        db()->prepare('UPDATE books SET isbn = ?, title = ?, author = ?, category = ?, publisher = ?, publication_year = ?, shelf_location = ?, total_copies = ?, available_copies = ? WHERE id = ?')
+            ->execute([$isbn, post('title'), post('author'), post('category'), post('publisher'), post('publication_year') ?: null, post('shelf_location'), $totalCopies, $totalCopies - $borrowed, $bookId]);
+        flash('Book updated.');
+        redirect('?action=books');
+    }
+
+    if ($formType === 'delete_book') {
+        $bookId = (int) post('book_id');
+        $loanStmt = db()->prepare('SELECT COUNT(*) FROM loans WHERE book_id = ?');
+        $loanStmt->execute([$bookId]);
+        if ((int) $loanStmt->fetchColumn() > 0) {
+            flash('This book has borrowing history and cannot be deleted.', 'error');
+        } else {
+            db()->prepare('DELETE FROM books WHERE id = ?')->execute([$bookId]);
+            flash('Book deleted.');
+        }
+        redirect('?action=books');
+    }
+
     $copies = max(1, (int) post('total_copies', '1'));
     $isbn = post('isbn');
 
@@ -480,6 +532,11 @@ function page_footer(): void
                 if (!dialog) return;
                 dialog.querySelector('[name="book_id"]').value = button.dataset.bookId || '';
                 dialog.querySelector('[data-book-title]').textContent = button.dataset.bookTitle || '';
+                const copyInput = dialog.querySelector('[name="copy_count"]');
+                if (copyInput && button.dataset.bookAvailable) {
+                    copyInput.max = button.dataset.bookAvailable;
+                    if (Number(copyInput.value) > Number(button.dataset.bookAvailable)) copyInput.value = button.dataset.bookAvailable;
+                }
                 if (typeof dialog.showModal === 'function') dialog.showModal();
                 else dialog.setAttribute('open', 'open');
             });
@@ -539,6 +596,20 @@ function page_footer(): void
             form.querySelectorAll('[name="borrower_type"], [name="student_class"]').forEach((input) => {
                 input.addEventListener('change', () => syncStudentFields(form));
             });
+        });
+        function syncCopyLimit(form) {
+            const bookSelect = form.querySelector('select[name="book_id"]');
+            const copyInput = form.querySelector('[name="copy_count"]');
+            if (!bookSelect || !copyInput) return;
+            const available = bookSelect.selectedOptions[0]?.dataset.available || '';
+            if (!available) return;
+            copyInput.max = available;
+            if (Number(copyInput.value) > Number(available)) copyInput.value = available;
+        }
+        document.querySelectorAll('form').forEach((form) => {
+            if (!form.querySelector('[name="copy_count"]')) return;
+            syncCopyLimit(form);
+            form.querySelector('select[name="book_id"]')?.addEventListener('change', () => syncCopyLimit(form));
         });
     </script>
     </body>
@@ -801,8 +872,13 @@ function librarians(): void
             flash('User updated.');
         } elseif (post('form_type') === 'delete_user') {
             $userId = (int) post('user_id');
+            $deleteUserStmt = db()->prepare('SELECT * FROM users WHERE id = ?');
+            $deleteUserStmt->execute([$userId]);
+            $deleteUser = $deleteUserStmt->fetch();
             if ($userId === (int) current_user()['id']) {
                 flash('You cannot delete your own account while logged in.', 'error');
+            } elseif ($deleteUser && is_protected_admin($deleteUser)) {
+                flash('This admin account cannot be deleted from the system.', 'error');
             } elseif (count_query('SELECT COUNT(*) FROM loans WHERE issued_by = ' . $userId . ' OR returned_by = ' . $userId) > 0) {
                 flash('This user has borrowing history and cannot be deleted.', 'error');
             } else {
@@ -876,6 +952,7 @@ function table_users(array $users): void
             <thead class="bg-zinc-50 text-zinc-500"><tr><th class="px-4 py-3">Photo</th><th class="px-4 py-3">Name</th><th class="px-4 py-3">Email</th><th class="px-4 py-3">Role</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Actions</th></tr></thead>
             <tbody class="divide-y">
             <?php foreach ($users as $user): ?>
+                <?php $protectedAdmin = is_protected_admin($user); ?>
                 <tr>
                     <td class="px-4 py-3">
                         <?php if (!empty($user['photo_path'])): ?>
@@ -898,14 +975,16 @@ function table_users(array $users): void
                                 <span class="material-symbols-outlined text-[18px]">edit</span>
                                 Edit
                             </button>
-                            <form method="post" onsubmit="return confirm('Delete this user?');">
-                                <input type="hidden" name="form_type" value="delete_user">
-                                <input type="hidden" name="user_id" value="<?= e((string) $user['id']) ?>">
-                                <button class="icon-button rounded-md bg-red-600 px-3 py-2 text-white">
-                                    <span class="material-symbols-outlined text-[18px]">delete</span>
-                                    Delete
-                                </button>
-                            </form>
+                            <?php if (!$protectedAdmin): ?>
+                                <form method="post" onsubmit="return confirm('Delete this user?');">
+                                    <input type="hidden" name="form_type" value="delete_user">
+                                    <input type="hidden" name="user_id" value="<?= e((string) $user['id']) ?>">
+                                    <button class="icon-button rounded-md bg-red-600 px-3 py-2 text-white">
+                                        <span class="material-symbols-outlined text-[18px]">delete</span>
+                                        Delete
+                                    </button>
+                                </form>
+                            <?php endif; ?>
                         </div>
                         <dialog id="viewUser<?= e((string) $user['id']) ?>" class="user-dialog rounded-md border bg-white p-0">
                             <div class="p-5">
@@ -1031,6 +1110,7 @@ function book_form_and_table(array $books, string $role): void
     <div class="grid gap-6 lg:grid-cols-[380px_1fr]">
         <form method="post" class="rounded-md border bg-white p-5">
             <h2 class="font-semibold"><?= e($heading) ?></h2>
+            <input type="hidden" name="form_type" value="add_book">
             <input name="title" required placeholder="Title" class="mt-4 w-full rounded-md border px-3 py-2">
             <input name="author" required placeholder="Author" class="mt-3 w-full rounded-md border px-3 py-2">
             <input name="category" required placeholder="Category" class="mt-3 w-full rounded-md border px-3 py-2">
@@ -1049,6 +1129,7 @@ function book_form_and_table(array $books, string $role): void
             <button class="mt-4 rounded-md primary-button px-4 py-2 text-white">Save Book</button>
         </form>
         <?php books_table($books); ?>
+        <?php if ($role === 'librarian') issue_dialog(); ?>
     </div>
     <?php
 }
@@ -1057,10 +1138,12 @@ function books_table(array $books): void
 {
     $user = current_user();
     $canIssue = $user && $user['role'] === 'librarian';
+    $canManage = $user && in_array($user['role'], ['admin', 'librarian'], true);
+    $showActions = $canIssue || $canManage;
     ?>
     <div class="overflow-x-auto rounded-md border bg-white">
         <table class="w-full text-left text-sm">
-            <thead class="bg-zinc-50 text-zinc-500"><tr><th class="px-4 py-3">Title</th><th class="px-4 py-3">Author</th><th class="px-4 py-3">Category</th><th class="px-4 py-3">Available</th><?php if ($canIssue): ?><th class="px-4 py-3">Action</th><?php endif; ?></tr></thead>
+            <thead class="bg-zinc-50 text-zinc-500"><tr><th class="px-4 py-3">Title</th><th class="px-4 py-3">Author</th><th class="px-4 py-3">Category</th><th class="px-4 py-3">Available</th><?php if ($showActions): ?><th class="px-4 py-3">Actions</th><?php endif; ?></tr></thead>
             <tbody class="divide-y">
             <?php foreach ($books as $book): ?>
                 <tr>
@@ -1068,22 +1151,93 @@ function books_table(array $books): void
                     <td class="px-4 py-3"><?= e($book['author']) ?></td>
                     <td class="px-4 py-3"><?= e($book['category']) ?></td>
                     <td class="px-4 py-3"><?= e((string) $book['available_copies']) ?> / <?= e((string) $book['total_copies']) ?></td>
-                    <?php if ($canIssue): ?>
+                    <?php if ($showActions): ?>
                         <td class="px-4 py-3">
-                            <?php if ((int) $book['available_copies'] > 0): ?>
-                                <button type="button" class="icon-button rounded-md primary-button px-3 py-1.5 text-white" data-open-issue data-book-id="<?= e((string) $book['id']) ?>" data-book-title="<?= e($book['title']) ?>">
-                                    <span class="material-symbols-outlined text-[18px]">assignment_add</span>
-                                    Issue
-                                </button>
-                            <?php else: ?>
-                                <span class="text-zinc-500">Unavailable</span>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <?php if ($canIssue): ?>
+                                    <?php if ((int) $book['available_copies'] > 0): ?>
+                                        <button type="button" class="icon-button rounded-md primary-button px-3 py-1.5 text-white" data-open-issue data-book-id="<?= e((string) $book['id']) ?>" data-book-title="<?= e($book['title']) ?>" data-book-available="<?= e((string) $book['available_copies']) ?>">
+                                            <span class="material-symbols-outlined text-[18px]">assignment_add</span>
+                                            Issue
+                                        </button>
+                                    <?php else: ?>
+                                        <span class="text-zinc-500">Unavailable</span>
+                                    <?php endif; ?>
+                                <?php endif; ?>
+                                <?php if ($canManage): ?>
+                                    <button type="button" class="icon-button rounded-md border px-3 py-1.5" data-open-dialog="editBook<?= e((string) $book['id']) ?>">
+                                        <span class="material-symbols-outlined text-[18px]">edit</span>
+                                        Edit
+                                    </button>
+                                    <form method="post" action="?action=books" onsubmit="return confirm('Delete this book?');">
+                                        <input type="hidden" name="form_type" value="delete_book">
+                                        <input type="hidden" name="book_id" value="<?= e((string) $book['id']) ?>">
+                                        <button class="icon-button rounded-md bg-red-600 px-3 py-1.5 text-white">
+                                            <span class="material-symbols-outlined text-[18px]">delete</span>
+                                            Delete
+                                        </button>
+                                    </form>
+                                <?php endif; ?>
+                            </div>
+                            <?php if ($canManage): ?>
+                                <dialog id="editBook<?= e((string) $book['id']) ?>" class="user-dialog rounded-md border bg-white p-0">
+                                    <form method="post" action="?action=books" class="spacious-form p-5">
+                                        <div class="flex items-center justify-between gap-3">
+                                            <h2 class="font-semibold">Edit Book</h2>
+                                            <button type="button" class="rounded-full border px-3 py-1 text-sm" data-close-dialog>Cancel</button>
+                                        </div>
+                                        <input type="hidden" name="form_type" value="edit_book">
+                                        <input type="hidden" name="book_id" value="<?= e((string) $book['id']) ?>">
+                                        <label class="mt-4 block text-sm font-medium">Title</label>
+                                        <input name="title" required value="<?= e($book['title']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                        <label class="mt-4 block text-sm font-medium">Author</label>
+                                        <input name="author" required value="<?= e($book['author']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                        <label class="mt-4 block text-sm font-medium">Category</label>
+                                        <input name="category" required value="<?= e($book['category']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                        <div class="mt-4 grid gap-3 sm:grid-cols-2">
+                                            <div>
+                                                <label class="block text-sm font-medium">ISBN</label>
+                                                <input name="isbn" value="<?= e($book['isbn'] ?? '') ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                            </div>
+                                            <div>
+                                                <label class="block text-sm font-medium">Publisher</label>
+                                                <input name="publisher" value="<?= e($book['publisher'] ?? '') ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                            </div>
+                                        </div>
+                                        <div class="mt-4 grid gap-3 sm:grid-cols-3">
+                                            <div>
+                                                <label class="block text-sm font-medium">Year</label>
+                                                <select name="publication_year" class="mt-2 w-full rounded-md border px-3 py-2">
+                                                    <option value="">Year</option>
+                                                    <?php for ($year = 1900; $year <= 3030; $year++): ?>
+                                                        <option value="<?= e((string) $year) ?>" <?= (string) ($book['publication_year'] ?? '') === (string) $year ? 'selected' : '' ?>><?= e((string) $year) ?></option>
+                                                    <?php endfor; ?>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label class="block text-sm font-medium">Shelf</label>
+                                                <input name="shelf_location" value="<?= e($book['shelf_location'] ?? '') ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                            </div>
+                                            <div>
+                                                <label class="block text-sm font-medium">Copies</label>
+                                                <input name="total_copies" type="number" min="1" value="<?= e((string) $book['total_copies']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                            </div>
+                                        </div>
+                                        <div class="mt-5 flex justify-end">
+                                            <button class="icon-button rounded-md primary-button px-4 py-2 text-white">
+                                                <span class="material-symbols-outlined text-[18px]">save</span>
+                                                Save Changes
+                                            </button>
+                                        </div>
+                                    </form>
+                                </dialog>
                             <?php endif; ?>
                         </td>
                     <?php endif; ?>
                 </tr>
             <?php endforeach; ?>
             <?php if (!$books): ?>
-                <tr><td colspan="<?= $canIssue ? '5' : '4' ?>" class="px-4 py-8 text-center text-zinc-500">No books found.</td></tr>
+                <tr><td colspan="<?= $showActions ? '5' : '4' ?>" class="px-4 py-8 text-center text-zinc-500">No books found.</td></tr>
             <?php endif; ?>
             </tbody>
         </table>
@@ -1123,7 +1277,7 @@ function issue_fields(array $books, bool $showBookSelect = false): void
             <div class="input-with-icon mt-2">
                 <span class="material-symbols-outlined text-[20px]">menu_book</span>
                 <select name="book_id" required class="w-full rounded-md border px-3 py-2">
-                    <?php foreach ($books as $book): ?><option value="<?= e((string) $book['id']) ?>"><?= e($book['title']) ?> (<?= e((string) $book['available_copies']) ?> available)</option><?php endforeach; ?>
+                    <?php foreach ($books as $book): ?><option value="<?= e((string) $book['id']) ?>" data-available="<?= e((string) $book['available_copies']) ?>"><?= e($book['title']) ?> (<?= e((string) $book['available_copies']) ?> available)</option><?php endforeach; ?>
                 </select>
             </div>
         </div>
@@ -1170,6 +1324,13 @@ function issue_fields(array $books, bool $showBookSelect = false): void
             <div class="input-with-icon mt-2">
                 <span class="material-symbols-outlined text-[20px]">person</span>
                 <input name="borrower_name" required placeholder="Borrower name" class="w-full rounded-md border px-3 py-2">
+            </div>
+        </div>
+        <div>
+            <label class="block text-sm font-medium">Number of Copies</label>
+            <div class="input-with-icon mt-2">
+                <span class="material-symbols-outlined text-[20px]">filter_1</span>
+                <input name="copy_count" type="number" min="1" value="1" required class="w-full rounded-md border px-3 py-2">
             </div>
         </div>
         <div>
@@ -1313,7 +1474,7 @@ function issue_loans_table(array $loans): void
     <div class="overflow-x-auto rounded-md border bg-white">
         <table class="w-full text-left text-sm">
             <thead class="bg-zinc-50 text-zinc-500">
-            <tr><th class="px-4 py-3">Borrower</th><th class="px-4 py-3">Book</th><th class="px-4 py-3">Borrowed</th><th class="px-4 py-3">Due Date</th><th class="px-4 py-3">Days Left</th><th class="px-4 py-3">Status</th></tr>
+            <tr><th class="px-4 py-3">Borrower</th><th class="px-4 py-3">Book</th><th class="px-4 py-3">Copies</th><th class="px-4 py-3">Borrowed</th><th class="px-4 py-3">Due Date</th><th class="px-4 py-3">Days Left</th><th class="px-4 py-3">Status</th></tr>
             </thead>
             <tbody class="divide-y">
             <?php foreach ($loans as $loan): ?>
@@ -1327,6 +1488,7 @@ function issue_loans_table(array $loans): void
                         <?php endif; ?>
                     </td>
                     <td class="px-4 py-3"><?= e($loan['title']) ?></td>
+                    <td class="px-4 py-3"><?= e((string) ($loan['copy_count'] ?? 1)) ?></td>
                     <td class="px-4 py-3"><?= e($loan['issue_date']) ?></td>
                     <td class="px-4 py-3"><?= e($loan['due_date']) ?></td>
                     <td class="px-4 py-3"><?= e($left >= 0 ? (string) $left : abs($left) . ' overdue') ?></td>
@@ -1334,7 +1496,7 @@ function issue_loans_table(array $loans): void
                 </tr>
             <?php endforeach; ?>
             <?php if (!$loans): ?>
-                <tr><td colspan="6" class="px-4 py-8 text-center text-zinc-500">No borrowing records found.</td></tr>
+                <tr><td colspan="7" class="px-4 py-8 text-center text-zinc-500">No borrowing records found.</td></tr>
             <?php endif; ?>
             </tbody>
         </table>
@@ -1354,7 +1516,7 @@ function returns(): void
             $fine = calculate_fine($loan['due_date']);
             db()->beginTransaction();
             db()->prepare("UPDATE loans SET status = 'returned', activity_status = 'inactive', return_date = CURDATE(), returned_by = ?, fine_amount = ? WHERE id = ?")->execute([current_user()['id'], $fine, $loanId]);
-            db()->prepare('UPDATE books SET available_copies = available_copies + 1 WHERE id = ?')->execute([$loan['book_id']]);
+            db()->prepare('UPDATE books SET available_copies = available_copies + ? WHERE id = ?')->execute([(int) ($loan['copy_count'] ?? 1), $loan['book_id']]);
             if ($fine > 0) {
                 db()->prepare('INSERT INTO fines (loan_id, member_id, amount) VALUES (?, ?, ?)')->execute([$loanId, $loan['member_id'], $fine]);
             }
@@ -1396,7 +1558,7 @@ function export_overdue(): void
 
     $output = fopen('php://output', 'w');
     fwrite($output, "\xEF\xBB\xBF");
-    fputcsv($output, ['Member', 'Phone', 'Email', 'Borrower Type', 'Class', 'Stream', 'Book', 'Issued', 'Due', 'Days Overdue', 'Fine Today', 'Notes']);
+    fputcsv($output, ['Member', 'Phone', 'Email', 'Borrower Type', 'Class', 'Stream', 'Book', 'Copies', 'Issued', 'Due', 'Days Overdue', 'Fine Today', 'Notes']);
     foreach ($loans as $loan) {
         $left = days_left($loan['due_date']);
         fputcsv($output, [
@@ -1407,6 +1569,7 @@ function export_overdue(): void
             csv_value($loan['student_class'] ?? ''),
             csv_value($loan['student_stream'] ?? ''),
             csv_value($loan['title']),
+            (string) ($loan['copy_count'] ?? 1),
             csv_value($loan['issue_date']),
             csv_value($loan['due_date']),
             (string) max(0, abs($left)),
@@ -1444,7 +1607,7 @@ function loans_table(array $loans, bool $withReturn = false): void
     ?>
     <div class="overflow-x-auto rounded-md border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
         <table class="w-full text-left text-sm">
-            <thead class="bg-zinc-50 text-zinc-500 dark:bg-zinc-950 dark:text-zinc-400"><tr><th class="px-4 py-3">Book</th><th class="px-4 py-3">Member</th><th class="px-4 py-3">Class</th><th class="px-4 py-3">Stream</th><th class="px-4 py-3">Issued</th><th class="px-4 py-3">Due</th><th class="px-4 py-3">Fine Today</th><th class="px-4 py-3">Action</th></tr></thead>
+            <thead class="bg-zinc-50 text-zinc-500 dark:bg-zinc-950 dark:text-zinc-400"><tr><th class="px-4 py-3">Book</th><th class="px-4 py-3">Member</th><th class="px-4 py-3">Class</th><th class="px-4 py-3">Stream</th><th class="px-4 py-3">Copies</th><th class="px-4 py-3">Issued</th><th class="px-4 py-3">Due</th><th class="px-4 py-3">Fine Today</th><th class="px-4 py-3">Action</th></tr></thead>
             <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
             <?php foreach ($loans as $loan): ?>
                 <tr>
@@ -1452,6 +1615,7 @@ function loans_table(array $loans, bool $withReturn = false): void
                     <td class="px-4 py-3"><?= e($loan['member_name']) ?></td>
                     <td class="px-4 py-3"><?= e($loan['student_class'] ?? '') ?></td>
                     <td class="px-4 py-3"><?= e($loan['student_stream'] ?? '') ?></td>
+                    <td class="px-4 py-3"><?= e((string) ($loan['copy_count'] ?? 1)) ?></td>
                     <td class="px-4 py-3"><?= e($loan['issue_date']) ?></td>
                     <td class="px-4 py-3"><?= e($loan['due_date']) ?></td>
                     <td class="px-4 py-3"><?= number_format(calculate_fine($loan['due_date']), 2) ?></td>
@@ -1465,7 +1629,7 @@ function loans_table(array $loans, bool $withReturn = false): void
                 </tr>
             <?php endforeach; ?>
             <?php if (!$loans): ?>
-                <tr><td colspan="8" class="px-4 py-8 text-center text-zinc-500 dark:text-zinc-400">No records found.</td></tr>
+                <tr><td colspan="9" class="px-4 py-8 text-center text-zinc-500 dark:text-zinc-400">No records found.</td></tr>
             <?php endif; ?>
             </tbody>
         </table>
@@ -1522,6 +1686,7 @@ function search_books(): void
         </button>
     </form>
     <?php books_table($books); ?>
+    <?php if (current_user()['role'] === 'librarian') issue_dialog(); ?>
     <?php
     page_footer();
 }
