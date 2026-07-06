@@ -44,6 +44,7 @@ CREATE TABLE loans (
     borrower_name VARCHAR(160) NULL,
     student_class VARCHAR(20) NULL,
     student_stream VARCHAR(60) NULL,
+    teacher_contact VARCHAR(80) NULL,
     issued_by INT NOT NULL,
     returned_by INT NULL,
     issue_date DATE NOT NULL,

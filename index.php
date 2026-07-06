@@ -65,6 +65,9 @@ function ensure_app_schema(): void
     if (!isset($columns['loans']['student_stream'])) {
         db()->exec('ALTER TABLE loans ADD student_stream VARCHAR(60) NULL AFTER student_class');
     }
+    if (!isset($columns['loans']['teacher_contact'])) {
+        db()->exec('ALTER TABLE loans ADD teacher_contact VARCHAR(80) NULL AFTER student_stream');
+    }
     if (!isset($columns['loans']['borrowing_period'])) {
         db()->exec('ALTER TABLE loans ADD borrowing_period INT NOT NULL DEFAULT 14 AFTER due_date');
     }
@@ -143,11 +146,13 @@ function update_overdue_loans(): void
 
 function issue_book_from_post(string $redirectTo = '?action=issue'): void
 {
+    ensure_app_schema();
     $bookId = (int) post('book_id');
     $borrowerType = in_array(post('borrower_type'), ['teacher', 'student'], true) ? post('borrower_type') : 'student';
     $borrowerName = post('borrower_name');
     $studentClass = $borrowerType === 'student' ? post('student_class') : '';
     $studentStream = $borrowerType === 'student' ? post('student_stream') : '';
+    $teacherContact = $borrowerType === 'teacher' ? post('teacher_contact') : '';
     $bookType = post('book_type') ?: 'General';
     $copyCount = max(1, (int) post('copy_count', '1'));
     $issueDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', post('issue_date')) ? post('issue_date') : date('Y-m-d');
@@ -160,6 +165,10 @@ function issue_book_from_post(string $redirectTo = '?action=issue'): void
     }
     if ($borrowerType === 'student' && ($studentClass === '' || $studentStream === '')) {
         flash('Student class and stream are required.', 'error');
+        redirect($redirectTo);
+    }
+    if ($borrowerType === 'teacher' && $teacherContact === '') {
+        flash('Teacher contact is required.', 'error');
         redirect($redirectTo);
     }
 
@@ -176,12 +185,12 @@ function issue_book_from_post(string $redirectTo = '?action=issue'): void
         redirect($redirectTo);
     }
 
-    db()->prepare("INSERT INTO members (member_no, name, status) VALUES (?, ?, 'active') ON DUPLICATE KEY UPDATE name = VALUES(name), status = 'active', id = LAST_INSERT_ID(id)")
-        ->execute([$memberNo, $borrowerName]);
+    db()->prepare("INSERT INTO members (member_no, name, phone, status) VALUES (?, ?, ?, 'active') ON DUPLICATE KEY UPDATE name = VALUES(name), phone = VALUES(phone), status = 'active', id = LAST_INSERT_ID(id)")
+        ->execute([$memberNo, $borrowerName, $teacherContact ?: null]);
     $memberId = (int) db()->lastInsertId();
 
-    $stmt = db()->prepare("INSERT INTO loans (book_id, member_id, issued_by, issue_date, due_date, book_type, copy_count, borrower_type, borrower_name, student_class, student_stream, borrowing_period, notes, activity_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')");
-    $stmt->execute([$bookId, $memberId, current_user()['id'], $issueDate, $dueDate, $bookType, $copyCount, $borrowerType, $borrowerName, $studentClass ?: null, $studentStream ?: null, $borrowingPeriod, $notes]);
+    $stmt = db()->prepare("INSERT INTO loans (book_id, member_id, issued_by, issue_date, due_date, book_type, copy_count, borrower_type, borrower_name, student_class, student_stream, teacher_contact, borrowing_period, notes, activity_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')");
+    $stmt->execute([$bookId, $memberId, current_user()['id'], $issueDate, $dueDate, $bookType, $copyCount, $borrowerType, $borrowerName, $studentClass ?: null, $studentStream ?: null, $teacherContact ?: null, $borrowingPeriod, $notes]);
     db()->prepare('UPDATE books SET available_copies = available_copies - ? WHERE id = ?')->execute([$copyCount, $bookId]);
     db()->commit();
 
@@ -240,10 +249,20 @@ function clear_failed_logins(string $email): void
     db()->prepare('DELETE FROM login_attempts WHERE email = ? AND ip_address = ?')->execute([$email, client_ip()]);
 }
 
-function complete_login(array $user): void
+function complete_login(array $user, bool $remember = false): void
 {
     session_regenerate_id(true);
     $_SESSION['user'] = $user;
+
+    if ($remember) {
+        setcookie(session_name(), session_id(), [
+            'expires' => time() + 60 * 60 * 24 * 30,
+            'path' => '/',
+            'httponly' => true,
+            'samesite' => 'Strict',
+            'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+        ]);
+    }
 }
 
 function nav_item(string $href, string $label, string $icon, ?int $badge = null): array
@@ -571,12 +590,17 @@ function page_footer(): void
         function syncStudentFields(form) {
             const checkedType = form.querySelector('[name="borrower_type"]:checked');
             const studentPanel = form.querySelector('[data-student-fields]');
+            const teacherPanel = form.querySelector('[data-teacher-fields]');
             const classSelect = form.querySelector('[name="student_class"]');
             const streamSelect = form.querySelector('[name="student_stream"]');
+            const teacherContact = form.querySelector('[name="teacher_contact"]');
             const isStudent = !checkedType || checkedType.value === 'student';
+            const isTeacher = checkedType?.value === 'teacher';
             if (studentPanel) studentPanel.hidden = !isStudent;
+            if (teacherPanel) teacherPanel.hidden = !isTeacher;
             if (classSelect) classSelect.required = isStudent;
             if (streamSelect) streamSelect.required = isStudent;
+            if (teacherContact) teacherContact.required = isTeacher;
             if (!isStudent || !classSelect || !streamSelect) return;
             const selectedStream = streamSelect.value;
             const streams = streamOptions[classSelect.value] || [];
@@ -591,7 +615,7 @@ function page_footer(): void
             }
         }
         document.querySelectorAll('form').forEach((form) => {
-            if (!form.querySelector('[data-student-fields]')) return;
+            if (!form.querySelector('[data-student-fields], [data-teacher-fields]')) return;
             syncStudentFields(form);
             form.querySelectorAll('[name="borrower_type"], [name="student_class"]').forEach((input) => {
                 input.addEventListener('change', () => syncStudentFields(form));
@@ -671,7 +695,7 @@ function login_page(): void
                 'role' => $user['role'],
                 'photo_path' => $user['photo_path'] ?? '',
             ];
-            complete_login($loginUser);
+            complete_login($loginUser, post('remember_me') === '1');
             redirect('?action=dashboard');
         }
 
@@ -684,19 +708,19 @@ function login_page(): void
 
     page_header('Login');
     ?>
-    <div class="grid min-h-screen place-items-center bg-zinc-950 px-4">
-        <form method="post" class="w-full max-w-md rounded-md bg-white p-8 shadow-xl">
+    <div class="login-shell grid min-h-screen place-items-center px-4">
+        <form method="post" class="login-card w-full max-w-md rounded-md p-8 shadow-xl">
             <div class="brand-stack mb-6">
                 <?php if ($schoolLogo !== ''): ?>
                     <img src="<?= e($schoolLogo) ?>" alt="<?= e($libraryName) ?> logo" class="site-logo rounded-md border">
                 <?php else: ?>
                     <div class="grid size-12 place-items-center rounded-md bg-lime-300 text-sm font-black leading-none text-zinc-950">LIB</div>
                 <?php endif; ?>
-                <p class="text-sm font-bold uppercase tracking-wide text-zinc-900"><?= e($libraryName) ?></p>
-                <p class="text-xs text-zinc-500"><?= e($schoolMotto !== '' ? $schoolMotto : 'Faith motto') ?></p>
+                <p class="text-sm font-bold uppercase tracking-wide"><?= e($libraryName) ?></p>
+                <p class="text-xs"><?= e($schoolMotto !== '' ? $schoolMotto : 'Faith motto') ?></p>
             </div>
             <div class="flex items-center justify-end">
-                <button type="button" id="themeToggle" class="theme-toggle inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm font-medium" aria-label="Toggle theme">
+                <button type="button" id="themeToggle" class="theme-toggle login-theme-toggle inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm font-medium" aria-label="Toggle theme">
                     <span id="themeIcon" class="material-symbols-outlined text-[18px]">dark_mode</span>
                     Theme
                 </button>
@@ -714,10 +738,70 @@ function login_page(): void
                     <span class="material-symbols-outlined text-[20px]">visibility</span>
                 </button>
             </div>
-            <button class="icon-button mt-6 w-full rounded-md primary-button px-4 py-2.5 font-medium text-white hover:bg-zinc-800">
+            <div class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm font-semibold">
+                <label class="inline-flex items-center gap-2">
+                    <input type="checkbox" name="remember_me" value="1">
+                    Remember me
+                </label>
+                <a class="login-link" href="?action=forgot_password">Forgot password</a>
+            </div>
+            <button class="icon-button mt-6 w-full primary-button px-4 py-2.5 font-medium text-white hover:bg-zinc-800">
                 <span class="material-symbols-outlined text-[20px]">login</span>
                 Login
             </button>
+        </form>
+    </div>
+    <?php
+    page_footer();
+}
+
+function forgot_password_page(): void
+{
+    if (current_user()) {
+        redirect('?action=dashboard');
+    }
+
+    $temporaryPassword = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $email = post('email');
+        $stmt = db()->prepare("SELECT id FROM users WHERE email = ? AND status = 'active'");
+        $stmt->execute([$email]);
+        $userId = (int) $stmt->fetchColumn();
+
+        if ($userId > 0) {
+            $temporaryPassword = 'LIB-' . bin2hex(random_bytes(4));
+            db()->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+                ->execute([password_hash($temporaryPassword, PASSWORD_DEFAULT), $userId]);
+            flash('Password reset created. Use the temporary password below to log in.');
+        } else {
+            flash('No active account was found for that email.', 'error');
+        }
+    }
+
+    page_header('Forgot Password');
+    ?>
+    <div class="login-shell grid min-h-screen place-items-center px-4">
+        <form method="post" class="login-card w-full max-w-md rounded-md p-8 shadow-xl">
+            <div class="brand-stack mb-6">
+                <div class="grid size-12 place-items-center rounded-md bg-lime-300 text-sm font-black leading-none text-zinc-950">LIB</div>
+                <p class="text-sm font-bold uppercase tracking-wide">Reset Password</p>
+                <p class="text-xs">Enter the email for your library account.</p>
+            </div>
+            <label class="block text-sm font-medium">Email</label>
+            <div class="input-with-icon mt-2">
+                <span class="material-symbols-outlined text-[20px]">mail</span>
+                <input name="email" type="email" required autocomplete="username" class="w-full rounded-md border px-3 py-2 focus:border-zinc-900 focus:outline-none">
+            </div>
+            <?php if ($temporaryPassword !== ''): ?>
+                <div class="mt-4 rounded-md border px-4 py-3 text-sm">
+                    Temporary password: <strong><?= e($temporaryPassword) ?></strong>
+                </div>
+            <?php endif; ?>
+            <button class="icon-button mt-6 w-full primary-button px-4 py-2.5 font-medium text-white">
+                <span class="material-symbols-outlined text-[20px]">restart_alt</span>
+                Reset password
+            </button>
+            <a class="login-link mt-4 block text-center text-sm font-semibold" href="?action=login">Back to login</a>
         </form>
     </div>
     <?php
@@ -1319,6 +1403,13 @@ function issue_fields(array $books, bool $showBookSelect = false): void
                 </select>
             </div>
         </div>
+        <div data-teacher-fields hidden>
+            <label class="block text-sm font-medium">Teacher Contact</label>
+            <div class="input-with-icon mt-2">
+                <span class="material-symbols-outlined text-[20px]">call</span>
+                <input name="teacher_contact" placeholder="Phone or email" class="w-full rounded-md border px-3 py-2">
+            </div>
+        </div>
         <div>
             <label class="block text-sm font-medium">Borrower Name</label>
             <div class="input-with-icon mt-2">
@@ -1420,7 +1511,7 @@ function issue_book(): void
         $params[] = $activityStatus;
     }
     $sqlWhere = $where ? 'WHERE ' . implode(' AND ', $where) : '';
-    $stmt = db()->prepare("SELECT loans.*, books.title, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id $sqlWhere ORDER BY loans.issue_date DESC, loans.id DESC");
+    $stmt = db()->prepare("SELECT loans.*, books.title, members.name AS member_name, users.email AS issued_by_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id LEFT JOIN users ON users.id = loans.issued_by $sqlWhere ORDER BY loans.issue_date DESC, loans.id DESC");
     $stmt->execute($params);
     $loans = $stmt->fetchAll();
 
@@ -1474,7 +1565,7 @@ function issue_loans_table(array $loans): void
     <div class="overflow-x-auto rounded-md border bg-white">
         <table class="w-full text-left text-sm">
             <thead class="bg-zinc-50 text-zinc-500">
-            <tr><th class="px-4 py-3">Borrower</th><th class="px-4 py-3">Book</th><th class="px-4 py-3">Copies</th><th class="px-4 py-3">Borrowed</th><th class="px-4 py-3">Due Date</th><th class="px-4 py-3">Days Left</th><th class="px-4 py-3">Status</th></tr>
+            <tr><th class="px-4 py-3">Borrower</th><th class="px-4 py-3">Book</th><th class="px-4 py-3">Librarian Email</th><th class="px-4 py-3">Copies</th><th class="px-4 py-3">Borrowed</th><th class="px-4 py-3">Due Date</th><th class="px-4 py-3">Days Left</th><th class="px-4 py-3">Status</th></tr>
             </thead>
             <tbody class="divide-y">
             <?php foreach ($loans as $loan): ?>
@@ -1486,8 +1577,12 @@ function issue_loans_table(array $loans): void
                         <?php if (($loan['borrower_type'] ?? '') === 'student' && !empty($loan['student_class'])): ?>
                             <div class="text-xs text-zinc-500"><?= e($loan['student_class']) ?> · <?= e($loan['student_stream'] ?? '') ?></div>
                         <?php endif; ?>
+                        <?php if (($loan['borrower_type'] ?? '') === 'teacher' && !empty($loan['teacher_contact'])): ?>
+                            <div class="text-xs text-zinc-500"><?= e($loan['teacher_contact']) ?></div>
+                        <?php endif; ?>
                     </td>
                     <td class="px-4 py-3"><?= e($loan['title']) ?></td>
+                    <td class="px-4 py-3"><?= e($loan['issued_by_email'] ?? '') ?></td>
                     <td class="px-4 py-3"><?= e((string) ($loan['copy_count'] ?? 1)) ?></td>
                     <td class="px-4 py-3"><?= e($loan['issue_date']) ?></td>
                     <td class="px-4 py-3"><?= e($loan['due_date']) ?></td>
@@ -1496,7 +1591,7 @@ function issue_loans_table(array $loans): void
                 </tr>
             <?php endforeach; ?>
             <?php if (!$loans): ?>
-                <tr><td colspan="7" class="px-4 py-8 text-center text-zinc-500">No borrowing records found.</td></tr>
+                <tr><td colspan="8" class="px-4 py-8 text-center text-zinc-500">No borrowing records found.</td></tr>
             <?php endif; ?>
             </tbody>
         </table>
@@ -1536,7 +1631,7 @@ function returns(): void
 function overdue_loans(): array
 {
     update_overdue_loans();
-    return db()->query("SELECT loans.*, books.title, members.name AS member_name, members.phone AS member_phone, members.email AS member_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id WHERE loans.status = 'overdue' ORDER BY loans.due_date")->fetchAll();
+    return db()->query("SELECT loans.*, books.title, members.name AS member_name, members.phone AS member_phone, members.email AS member_email, users.email AS issued_by_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id LEFT JOIN users ON users.id = loans.issued_by WHERE loans.status = 'overdue' ORDER BY loans.due_date")->fetchAll();
 }
 
 function csv_value(?string $value): string
@@ -1558,7 +1653,7 @@ function export_overdue(): void
 
     $output = fopen('php://output', 'w');
     fwrite($output, "\xEF\xBB\xBF");
-    fputcsv($output, ['Member', 'Phone', 'Email', 'Borrower Type', 'Class', 'Stream', 'Book', 'Copies', 'Issued', 'Due', 'Days Overdue', 'Fine Today', 'Notes']);
+    fputcsv($output, ['Member', 'Phone', 'Email', 'Borrower Type', 'Class', 'Stream', 'Book', 'Librarian Email', 'Copies', 'Issued', 'Due', 'Days Overdue', 'Fine Today', 'Notes']);
     foreach ($loans as $loan) {
         $left = days_left($loan['due_date']);
         fputcsv($output, [
@@ -1569,6 +1664,7 @@ function export_overdue(): void
             csv_value($loan['student_class'] ?? ''),
             csv_value($loan['student_stream'] ?? ''),
             csv_value($loan['title']),
+            csv_value($loan['issued_by_email'] ?? ''),
             (string) ($loan['copy_count'] ?? 1),
             csv_value($loan['issue_date']),
             csv_value($loan['due_date']),
@@ -1819,6 +1915,7 @@ function backup(): void
 try {
     match ($action) {
         'login' => login_page(),
+        'forgot_password' => forgot_password_page(),
         'logout' => (session_destroy() || true) ? redirect('?action=login') : null,
         'dashboard' => dashboard(),
         'librarians' => librarians(),
