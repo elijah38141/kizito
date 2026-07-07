@@ -36,16 +36,47 @@ function ensure_app_schema(): void
         return;
     }
 
-    $columns = ['users' => [], 'loans' => []];
+    $columns = ['users' => [], 'loans' => [], 'books' => []];
     foreach (db()->query('SHOW COLUMNS FROM users')->fetchAll() as $column) {
         $columns['users'][$column['Field']] = true;
     }
     foreach (db()->query('SHOW COLUMNS FROM loans')->fetchAll() as $column) {
         $columns['loans'][$column['Field']] = true;
     }
+    foreach (db()->query('SHOW COLUMNS FROM books')->fetchAll() as $column) {
+        $columns['books'][$column['Field']] = true;
+    }
 
     if (!isset($columns['users']['photo_path'])) {
         db()->exec('ALTER TABLE users ADD photo_path VARCHAR(255) NULL AFTER status');
+    }
+    if (!isset($columns['books']['book_number'])) {
+        db()->exec('ALTER TABLE books ADD book_number VARCHAR(40) NULL AFTER id');
+    }
+    db()->exec("UPDATE books SET book_number = CONCAT('BK-', LPAD(id, 6, '0')) WHERE book_number IS NULL OR book_number = ''");
+    if (!isset($columns['books']['target_class'])) {
+        db()->exec("ALTER TABLE books ADD target_class VARCHAR(20) NOT NULL DEFAULT 'General' AFTER category");
+    }
+    if (!isset($columns['books']['teacher_copies'])) {
+        db()->exec('ALTER TABLE books ADD teacher_copies INT NOT NULL DEFAULT 0 AFTER shelf_location');
+    }
+    if (!isset($columns['books']['student_copies'])) {
+        db()->exec('ALTER TABLE books ADD student_copies INT NOT NULL DEFAULT 0 AFTER teacher_copies');
+    }
+    db()->exec('UPDATE books SET student_copies = total_copies WHERE student_copies = 0 AND teacher_copies = 0 AND total_copies > 0');
+    $bookIndexes = db()->query("SELECT INDEX_NAME, NON_UNIQUE, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS indexed_columns FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'books' GROUP BY INDEX_NAME, NON_UNIQUE")->fetchAll();
+    $hasBookNumberKey = false;
+    foreach ($bookIndexes as $index) {
+        if ((int) $index['NON_UNIQUE'] === 0 && $index['indexed_columns'] === 'book_number') {
+            $hasBookNumberKey = true;
+        }
+        if ((int) $index['NON_UNIQUE'] === 0 && in_array($index['indexed_columns'], ['isbn', 'isbn,target_class'], true)) {
+            $indexName = str_replace('`', '``', $index['INDEX_NAME']);
+            db()->exec("ALTER TABLE books DROP INDEX `$indexName`");
+        }
+    }
+    if (!$hasBookNumberKey) {
+        db()->exec('ALTER TABLE books ADD UNIQUE KEY book_number_unique (book_number)');
     }
     if (!isset($columns['loans']['book_type'])) {
         db()->exec("ALTER TABLE loans ADD book_type VARCHAR(80) NOT NULL DEFAULT 'General' AFTER member_id");
@@ -275,21 +306,50 @@ function is_protected_admin(array $user): bool
     return strtolower((string) ($user['email'] ?? '')) === PROTECTED_ADMIN_EMAIL && ($user['role'] ?? '') === 'admin';
 }
 
+function catalog_book_number(int $bookId): string
+{
+    return 'BK-' . str_pad((string) $bookId, 6, '0', STR_PAD_LEFT);
+}
+
+function book_display_label(array $book): string
+{
+    $bookId = (int) ($book['book_id'] ?? $book['id'] ?? 0);
+    $number = trim((string) ($book['book_number'] ?? ''));
+    if ($number === '' && $bookId > 0) {
+        $number = catalog_book_number($bookId);
+    }
+
+    $title = trim((string) ($book['title'] ?? 'Untitled book'));
+    $author = trim((string) ($book['author'] ?? ''));
+    $category = trim((string) ($book['category'] ?? ''));
+    $class = trim((string) ($book['target_class'] ?? ''));
+    $details = array_filter([$category, $class !== '' ? $class : null]);
+
+    $label = $number !== '' ? $number . ' - ' . $title : $title;
+    if ($author !== '') {
+        $label .= ' by ' . $author;
+    }
+    if ($details) {
+        $label .= ' (' . implode(', ', $details) . ')';
+    }
+
+    return $label;
+}
+
 function save_book_from_post(): void
 {
     $formType = post('form_type', 'add_book');
     if ($formType === 'edit_book') {
         $bookId = (int) post('book_id');
-        $totalCopies = max(1, (int) post('total_copies', '1'));
+        $teacherCopies = max(0, (int) post('teacher_copies', '0'));
+        $studentCopies = max(0, (int) post('student_copies', '0'));
+        $totalCopies = $teacherCopies + $studentCopies;
         $isbn = post('isbn') ?: null;
+        $targetClass = post('target_class') ?: 'General';
 
-        if ($isbn !== null) {
-            $existing = db()->prepare('SELECT id FROM books WHERE isbn = ? AND id <> ?');
-            $existing->execute([$isbn, $bookId]);
-            if ($existing->fetchColumn()) {
-                flash('Another book already uses this ISBN.', 'error');
-                redirect('?action=books');
-            }
+        if ($totalCopies < 1) {
+            flash('Enter at least one teacher or student copy.', 'error');
+            redirect('?action=books');
         }
 
         $borrowedStmt = db()->prepare("SELECT COALESCE(SUM(copy_count), 0) FROM loans WHERE book_id = ? AND status IN ('borrowed', 'overdue')");
@@ -300,8 +360,8 @@ function save_book_from_post(): void
             redirect('?action=books');
         }
 
-        db()->prepare('UPDATE books SET isbn = ?, title = ?, author = ?, category = ?, publisher = ?, publication_year = ?, shelf_location = ?, total_copies = ?, available_copies = ? WHERE id = ?')
-            ->execute([$isbn, post('title'), post('author'), post('category'), post('publisher'), post('publication_year') ?: null, post('shelf_location'), $totalCopies, $totalCopies - $borrowed, $bookId]);
+        db()->prepare('UPDATE books SET isbn = ?, title = ?, author = ?, category = ?, target_class = ?, publisher = ?, publication_year = ?, shelf_location = ?, teacher_copies = ?, student_copies = ?, total_copies = ?, available_copies = ? WHERE id = ?')
+            ->execute([$isbn, post('title'), post('author'), post('category'), $targetClass, post('publisher'), post('publication_year') ?: null, post('shelf_location'), $teacherCopies, $studentCopies, $totalCopies, $totalCopies - $borrowed, $bookId]);
         flash('Book updated.');
         redirect('?action=books');
     }
@@ -319,23 +379,21 @@ function save_book_from_post(): void
         redirect('?action=books');
     }
 
-    $copies = max(1, (int) post('total_copies', '1'));
+    $teacherCopies = max(0, (int) post('teacher_copies', '0'));
+    $studentCopies = max(0, (int) post('student_copies', '1'));
+    $copies = $teacherCopies + $studentCopies;
     $isbn = post('isbn');
+    $targetClass = post('target_class') ?: 'General';
 
-    if ($isbn !== '') {
-        $existing = db()->prepare('SELECT id FROM books WHERE isbn = ?');
-        $existing->execute([$isbn]);
-        $bookId = (int) $existing->fetchColumn();
-        if ($bookId > 0) {
-            db()->prepare('UPDATE books SET total_copies = total_copies + ?, available_copies = available_copies + ?, title = ?, author = ?, category = ?, publisher = ?, publication_year = ?, shelf_location = ? WHERE id = ?')
-                ->execute([$copies, $copies, post('title'), post('author'), post('category'), post('publisher'), post('publication_year') ?: null, post('shelf_location'), $bookId]);
-            flash('Book copies added to the catalog.');
-            redirect('?action=books');
-        }
+    if ($copies < 1) {
+        flash('Enter at least one teacher or student copy.', 'error');
+        redirect('?action=books');
     }
 
-    $stmt = db()->prepare('INSERT INTO books (isbn, title, author, category, publisher, publication_year, shelf_location, total_copies, available_copies) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    $stmt->execute([$isbn ?: null, post('title'), post('author'), post('category'), post('publisher'), post('publication_year') ?: null, post('shelf_location'), $copies, $copies]);
+    $stmt = db()->prepare('INSERT INTO books (isbn, title, author, category, target_class, publisher, publication_year, shelf_location, teacher_copies, student_copies, total_copies, available_copies) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    $stmt->execute([$isbn ?: null, post('title'), post('author'), post('category'), $targetClass, post('publisher'), post('publication_year') ?: null, post('shelf_location'), $teacherCopies, $studentCopies, $copies, $copies]);
+    $bookId = (int) db()->lastInsertId();
+    db()->prepare('UPDATE books SET book_number = ? WHERE id = ?')->execute([catalog_book_number($bookId), $bookId]);
     flash('Book added to the catalog.');
     redirect('?action=books');
 }
@@ -374,6 +432,11 @@ function setting_list(string $key, array $fallback): array
 function student_classes(): array
 {
     return ['Senior 1', 'Senior 2', 'Senior 3', 'Senior 4', 'Senior 5', 'Senior 6'];
+}
+
+function book_class_options(): array
+{
+    return array_merge(['General'], student_classes());
 }
 
 function streams_for_class(string $class): array
@@ -811,6 +874,7 @@ function forgot_password_page(): void
 function dashboard(): void
 {
     require_login();
+    ensure_app_schema();
     update_overdue_loans();
 
     $stats = [
@@ -829,7 +893,7 @@ function dashboard(): void
     foreach ($statusRows as $row) {
         $statusCounts[$row['status']] = (int) $row['total'];
     }
-    $loans = db()->query("SELECT loans.*, books.title, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id ORDER BY loans.id DESC LIMIT 8")->fetchAll();
+    $loans = db()->query("SELECT loans.*, books.book_number, books.title, books.author, books.category, books.target_class, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id ORDER BY loans.id DESC LIMIT 8")->fetchAll();
 
     page_header('Dashboard');
     ?>
@@ -906,7 +970,7 @@ function dashboard(): void
                 </thead>
                 <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
                 <?php foreach ($loans as $loan): ?>
-                    <tr><td class="px-4 py-3"><?= e($loan['title']) ?></td><td class="px-4 py-3"><?= e($loan['member_name']) ?></td><td class="px-4 py-3"><?= e($loan['due_date']) ?></td><td class="px-4 py-3"><?= e($loan['status']) ?></td></tr>
+                    <tr><td class="px-4 py-3"><?= e(book_display_label($loan)) ?></td><td class="px-4 py-3"><?= e($loan['member_name']) ?></td><td class="px-4 py-3"><?= e($loan['due_date']) ?></td><td class="px-4 py-3"><?= e($loan['status']) ?></td></tr>
                 <?php endforeach; ?>
                 <?php if (!$loans): ?>
                     <tr><td colspan="4" class="px-4 py-8 text-center text-zinc-500 dark:text-zinc-400">No borrowing activity yet.</td></tr>
@@ -1159,24 +1223,30 @@ function books(): void
 
     $q = trim($_GET['q'] ?? '');
     if ($q !== '') {
-        $stmt = db()->prepare('SELECT * FROM books WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ? OR category LIKE ? ORDER BY title');
+        $stmt = db()->prepare('SELECT * FROM books WHERE book_number LIKE ? OR title LIKE ? OR author LIKE ? OR isbn LIKE ? OR category LIKE ? OR target_class LIKE ? ORDER BY book_number, title, target_class');
         $like = '%' . $q . '%';
-        $stmt->execute([$like, $like, $like, $like]);
+        $stmt->execute([$like, $like, $like, $like, $like, $like]);
         $books = $stmt->fetchAll();
     } else {
-        $books = db()->query('SELECT * FROM books ORDER BY title')->fetchAll();
+        $books = db()->query('SELECT * FROM books ORDER BY book_number, title, target_class')->fetchAll();
     }
 
     page_header($user['role'] === 'admin' ? 'Manage Books' : 'Book Catalog');
     ?>
-    <form class="mb-5 flex max-w-2xl gap-3">
-        <input type="hidden" name="action" value="books">
-        <input name="q" value="<?= e($q) ?>" placeholder="Search book catalog" class="flex-1 rounded-md border px-3 py-2">
-        <button class="icon-button rounded-md primary-button px-4 py-2 text-white">
-            <span class="material-symbols-outlined text-[18px]">search</span>
-            Search
-        </button>
-    </form>
+    <div class="mb-5 flex flex-wrap items-center gap-3">
+        <form class="flex max-w-2xl flex-1 gap-3">
+            <input type="hidden" name="action" value="books">
+            <input name="q" value="<?= e($q) ?>" placeholder="Search book catalog by number, title, author, category, or class" class="flex-1 rounded-md border px-3 py-2">
+            <button class="icon-button rounded-md primary-button px-4 py-2 text-white">
+                <span class="material-symbols-outlined text-[18px]">search</span>
+                Search
+            </button>
+        </form>
+        <a class="icon-button rounded-md border px-4 py-2 text-sm" href="?action=export_books<?= $q !== '' ? '&q=' . urlencode($q) : '' ?>">
+            <span class="material-symbols-outlined text-[18px]">download</span>
+            Export Excel
+        </a>
+    </div>
     <?php
     if (in_array($user['role'], ['admin', 'librarian'], true)) {
         book_form_and_table($books, $user['role']);
@@ -1185,6 +1255,51 @@ function books(): void
         issue_dialog();
     }
     page_footer();
+}
+
+function export_books(): void
+{
+    require_login();
+    ensure_app_schema();
+
+    $q = trim($_GET['q'] ?? '');
+    if ($q !== '') {
+        $stmt = db()->prepare('SELECT * FROM books WHERE book_number LIKE ? OR title LIKE ? OR author LIKE ? OR isbn LIKE ? OR category LIKE ? OR target_class LIKE ? ORDER BY book_number, title, target_class');
+        $like = '%' . $q . '%';
+        $stmt->execute([$like, $like, $like, $like, $like, $like]);
+        $books = $stmt->fetchAll();
+    } else {
+        $books = db()->query('SELECT * FROM books ORDER BY book_number, title, target_class')->fetchAll();
+    }
+
+    $filename = 'book_catalog_' . date('Ymd_His') . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+
+    $output = fopen('php://output', 'w');
+    fwrite($output, "\xEF\xBB\xBF");
+    fputcsv($output, ['Book No.', 'Title', 'Author', 'Category', 'Class', 'Teacher Copies', 'Student Copies', 'Total Copies', 'Available Copies', 'ISBN', 'Publisher', 'Year', 'Shelf']);
+    foreach ($books as $book) {
+        fputcsv($output, [
+            csv_value($book['book_number'] ?? catalog_book_number((int) $book['id'])),
+            csv_value($book['title']),
+            csv_value($book['author']),
+            csv_value($book['category']),
+            csv_value($book['target_class'] ?? 'General'),
+            (string) ($book['teacher_copies'] ?? 0),
+            (string) ($book['student_copies'] ?? $book['total_copies']),
+            (string) $book['total_copies'],
+            (string) $book['available_copies'],
+            csv_value($book['isbn'] ?? ''),
+            csv_value($book['publisher'] ?? ''),
+            csv_value((string) ($book['publication_year'] ?? '')),
+            csv_value($book['shelf_location'] ?? ''),
+        ]);
+    }
+    fclose($output);
+    exit;
 }
 
 function book_form_and_table(array $books, string $role): void
@@ -1198,9 +1313,14 @@ function book_form_and_table(array $books, string $role): void
             <input name="title" required placeholder="Title" class="mt-4 w-full rounded-md border px-3 py-2">
             <input name="author" required placeholder="Author" class="mt-3 w-full rounded-md border px-3 py-2">
             <input name="category" required placeholder="Category" class="mt-3 w-full rounded-md border px-3 py-2">
+            <select name="target_class" required class="mt-3 w-full rounded-md border px-3 py-2">
+                <?php foreach (book_class_options() as $class): ?>
+                    <option value="<?= e($class) ?>"><?= e($class) ?></option>
+                <?php endforeach; ?>
+            </select>
             <input name="isbn" placeholder="ISBN" class="mt-3 w-full rounded-md border px-3 py-2">
             <input name="publisher" placeholder="Publisher" class="mt-3 w-full rounded-md border px-3 py-2">
-            <div class="mt-3 grid grid-cols-3 gap-3">
+            <div class="mt-3 grid gap-3 sm:grid-cols-2">
                 <select name="publication_year" class="rounded-md border px-3 py-2">
                     <option value="">Year</option>
                     <?php for ($year = 1900; $year <= 3030; $year++): ?>
@@ -1208,7 +1328,8 @@ function book_form_and_table(array $books, string $role): void
                     <?php endfor; ?>
                 </select>
                 <input name="shelf_location" placeholder="Shelf" class="rounded-md border px-3 py-2">
-                <input name="total_copies" type="number" min="1" value="1" class="rounded-md border px-3 py-2">
+                <input name="teacher_copies" type="number" min="0" value="0" placeholder="Teacher copies" class="rounded-md border px-3 py-2">
+                <input name="student_copies" type="number" min="0" value="1" placeholder="Student copies" class="rounded-md border px-3 py-2">
             </div>
             <button class="mt-4 rounded-md primary-button px-4 py-2 text-white">Save Book</button>
         </form>
@@ -1227,38 +1348,40 @@ function books_table(array $books): void
     ?>
     <div class="overflow-x-auto rounded-md border bg-white">
         <table class="w-full text-left text-sm">
-            <thead class="bg-zinc-50 text-zinc-500"><tr><th class="px-4 py-3">Title</th><th class="px-4 py-3">Author</th><th class="px-4 py-3">Category</th><th class="px-4 py-3">Available</th><?php if ($showActions): ?><th class="px-4 py-3">Actions</th><?php endif; ?></tr></thead>
+            <thead class="bg-zinc-50 text-zinc-500"><tr><th class="px-4 py-3">Book No.</th><th class="px-4 py-3">Title</th><th class="px-4 py-3">Author</th><th class="px-4 py-3">Category</th><th class="px-4 py-3">Class</th><th class="px-4 py-3">Copies</th><?php if ($showActions): ?><th class="px-4 py-3">Actions</th><?php endif; ?></tr></thead>
             <tbody class="divide-y">
             <?php foreach ($books as $book): ?>
                 <tr>
+                    <td class="px-4 py-3 font-semibold text-zinc-600"><?= e($book['book_number'] ?? catalog_book_number((int) $book['id'])) ?></td>
                     <td class="px-4 py-3 font-medium"><?= e($book['title']) ?></td>
                     <td class="px-4 py-3"><?= e($book['author']) ?></td>
                     <td class="px-4 py-3"><?= e($book['category']) ?></td>
-                    <td class="px-4 py-3"><?= e((string) $book['available_copies']) ?> / <?= e((string) $book['total_copies']) ?></td>
+                    <td class="px-4 py-3"><?= e($book['target_class'] ?? 'General') ?></td>
+                    <td class="px-4 py-3">
+                        <div><?= e((string) $book['available_copies']) ?> / <?= e((string) $book['total_copies']) ?> available</div>
+                        <div class="text-xs text-zinc-500">Teacher: <?= e((string) ($book['teacher_copies'] ?? 0)) ?> · Student: <?= e((string) ($book['student_copies'] ?? $book['total_copies'])) ?></div>
+                    </td>
                     <?php if ($showActions): ?>
                         <td class="px-4 py-3">
                             <div class="flex flex-wrap items-center gap-2">
                                 <?php if ($canIssue): ?>
                                     <?php if ((int) $book['available_copies'] > 0): ?>
-                                        <button type="button" class="icon-button rounded-md primary-button px-3 py-1.5 text-white" data-open-issue data-book-id="<?= e((string) $book['id']) ?>" data-book-title="<?= e($book['title']) ?>" data-book-available="<?= e((string) $book['available_copies']) ?>">
+                                        <button type="button" class="icon-button rounded-md primary-button px-3 py-1.5 text-white" data-open-issue data-book-id="<?= e((string) $book['id']) ?>" data-book-title="<?= e(book_display_label($book)) ?>" data-book-available="<?= e((string) $book['available_copies']) ?>" title="Issue book" aria-label="Issue book">
                                             <span class="material-symbols-outlined text-[18px]">assignment_add</span>
-                                            Issue
                                         </button>
                                     <?php else: ?>
                                         <span class="text-zinc-500">Unavailable</span>
                                     <?php endif; ?>
                                 <?php endif; ?>
                                 <?php if ($canManage): ?>
-                                    <button type="button" class="icon-button rounded-md border px-3 py-1.5" data-open-dialog="editBook<?= e((string) $book['id']) ?>">
+                                    <button type="button" class="icon-button rounded-md border px-3 py-1.5" data-open-dialog="editBook<?= e((string) $book['id']) ?>" title="Edit book" aria-label="Edit book">
                                         <span class="material-symbols-outlined text-[18px]">edit</span>
-                                        Edit
                                     </button>
                                     <form method="post" action="?action=books" onsubmit="return confirm('Delete this book?');">
                                         <input type="hidden" name="form_type" value="delete_book">
                                         <input type="hidden" name="book_id" value="<?= e((string) $book['id']) ?>">
-                                        <button class="icon-button rounded-md bg-red-600 px-3 py-1.5 text-white">
+                                        <button class="icon-button rounded-md bg-red-600 px-3 py-1.5 text-white" title="Delete book" aria-label="Delete book">
                                             <span class="material-symbols-outlined text-[18px]">delete</span>
-                                            Delete
                                         </button>
                                     </form>
                                 <?php endif; ?>
@@ -1272,12 +1395,19 @@ function books_table(array $books): void
                                         </div>
                                         <input type="hidden" name="form_type" value="edit_book">
                                         <input type="hidden" name="book_id" value="<?= e((string) $book['id']) ?>">
+                                        <div class="mt-4 text-sm text-zinc-500">Book No. <span class="font-semibold text-zinc-800"><?= e($book['book_number'] ?? catalog_book_number((int) $book['id'])) ?></span></div>
                                         <label class="mt-4 block text-sm font-medium">Title</label>
                                         <input name="title" required value="<?= e($book['title']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
                                         <label class="mt-4 block text-sm font-medium">Author</label>
                                         <input name="author" required value="<?= e($book['author']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
                                         <label class="mt-4 block text-sm font-medium">Category</label>
                                         <input name="category" required value="<?= e($book['category']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                        <label class="mt-4 block text-sm font-medium">Class</label>
+                                        <select name="target_class" required class="mt-2 w-full rounded-md border px-3 py-2">
+                                            <?php foreach (book_class_options() as $class): ?>
+                                                <option value="<?= e($class) ?>" <?= ($book['target_class'] ?? 'General') === $class ? 'selected' : '' ?>><?= e($class) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
                                         <div class="mt-4 grid gap-3 sm:grid-cols-2">
                                             <div>
                                                 <label class="block text-sm font-medium">ISBN</label>
@@ -1288,7 +1418,7 @@ function books_table(array $books): void
                                                 <input name="publisher" value="<?= e($book['publisher'] ?? '') ?>" class="mt-2 w-full rounded-md border px-3 py-2">
                                             </div>
                                         </div>
-                                        <div class="mt-4 grid gap-3 sm:grid-cols-3">
+                                        <div class="mt-4 grid gap-3 sm:grid-cols-2">
                                             <div>
                                                 <label class="block text-sm font-medium">Year</label>
                                                 <select name="publication_year" class="mt-2 w-full rounded-md border px-3 py-2">
@@ -1303,8 +1433,12 @@ function books_table(array $books): void
                                                 <input name="shelf_location" value="<?= e($book['shelf_location'] ?? '') ?>" class="mt-2 w-full rounded-md border px-3 py-2">
                                             </div>
                                             <div>
-                                                <label class="block text-sm font-medium">Copies</label>
-                                                <input name="total_copies" type="number" min="1" value="<?= e((string) $book['total_copies']) ?>" class="mt-2 w-full rounded-md border px-3 py-2">
+                                                <label class="block text-sm font-medium">Teacher Copies</label>
+                                                <input name="teacher_copies" type="number" min="0" value="<?= e((string) ($book['teacher_copies'] ?? 0)) ?>" placeholder="Teacher copies" class="mt-2 w-full rounded-md border px-3 py-2">
+                                            </div>
+                                            <div>
+                                                <label class="block text-sm font-medium">Student Copies</label>
+                                                <input name="student_copies" type="number" min="0" value="<?= e((string) ($book['student_copies'] ?? $book['total_copies'])) ?>" placeholder="Student copies" class="mt-2 w-full rounded-md border px-3 py-2">
                                             </div>
                                         </div>
                                         <div class="mt-5 flex justify-end">
@@ -1321,7 +1455,7 @@ function books_table(array $books): void
                 </tr>
             <?php endforeach; ?>
             <?php if (!$books): ?>
-                <tr><td colspan="<?= $showActions ? '5' : '4' ?>" class="px-4 py-8 text-center text-zinc-500">No books found.</td></tr>
+                <tr><td colspan="<?= $showActions ? '7' : '6' ?>" class="px-4 py-8 text-center text-zinc-500">No books found.</td></tr>
             <?php endif; ?>
             </tbody>
         </table>
@@ -1331,7 +1465,7 @@ function books_table(array $books): void
 
 function issue_dialog(?array $books = null): void
 {
-    $books ??= db()->query('SELECT * FROM books WHERE available_copies > 0 ORDER BY title')->fetchAll();
+    $books ??= db()->query('SELECT * FROM books WHERE available_copies > 0 ORDER BY title, target_class')->fetchAll();
     ?>
     <dialog id="issueDialog" class="issue-dialog rounded-md border bg-white p-0">
         <form method="post" action="?action=issue" class="spacious-form p-5">
@@ -1361,7 +1495,7 @@ function issue_fields(array $books, bool $showBookSelect = false): void
             <div class="input-with-icon mt-2">
                 <span class="material-symbols-outlined text-[20px]">menu_book</span>
                 <select name="book_id" required class="w-full rounded-md border px-3 py-2">
-                    <?php foreach ($books as $book): ?><option value="<?= e((string) $book['id']) ?>" data-available="<?= e((string) $book['available_copies']) ?>"><?= e($book['title']) ?> (<?= e((string) $book['available_copies']) ?> available)</option><?php endforeach; ?>
+                    <?php foreach ($books as $book): ?><option value="<?= e((string) $book['id']) ?>" data-available="<?= e((string) $book['available_copies']) ?>"><?= e(book_display_label($book)) ?> (<?= e((string) $book['available_copies']) ?> available)</option><?php endforeach; ?>
                 </select>
             </div>
         </div>
@@ -1497,7 +1631,7 @@ function issue_book(): void
         issue_book_from_post('?action=issue');
     }
 
-    $books = db()->query('SELECT * FROM books WHERE available_copies > 0 ORDER BY title')->fetchAll();
+    $books = db()->query('SELECT * FROM books WHERE available_copies > 0 ORDER BY title, target_class')->fetchAll();
     $borrowerType = $_GET['borrower_type'] ?? '';
     $activityStatus = $_GET['activity_status'] ?? '';
     $where = [];
@@ -1511,7 +1645,7 @@ function issue_book(): void
         $params[] = $activityStatus;
     }
     $sqlWhere = $where ? 'WHERE ' . implode(' AND ', $where) : '';
-    $stmt = db()->prepare("SELECT loans.*, books.title, members.name AS member_name, users.email AS issued_by_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id LEFT JOIN users ON users.id = loans.issued_by $sqlWhere ORDER BY loans.issue_date DESC, loans.id DESC");
+    $stmt = db()->prepare("SELECT loans.*, books.book_number, books.title, books.author, books.category, books.target_class, members.name AS member_name, users.email AS issued_by_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id LEFT JOIN users ON users.id = loans.issued_by $sqlWhere ORDER BY loans.issue_date DESC, loans.id DESC");
     $stmt->execute($params);
     $loans = $stmt->fetchAll();
 
@@ -1581,7 +1715,7 @@ function issue_loans_table(array $loans): void
                             <div class="text-xs text-zinc-500"><?= e($loan['teacher_contact']) ?></div>
                         <?php endif; ?>
                     </td>
-                    <td class="px-4 py-3"><?= e($loan['title']) ?></td>
+                    <td class="px-4 py-3"><?= e(book_display_label($loan)) ?></td>
                     <td class="px-4 py-3"><?= e($loan['issued_by_email'] ?? '') ?></td>
                     <td class="px-4 py-3"><?= e((string) ($loan['copy_count'] ?? 1)) ?></td>
                     <td class="px-4 py-3"><?= e($loan['issue_date']) ?></td>
@@ -1602,6 +1736,7 @@ function issue_loans_table(array $loans): void
 function returns(): void
 {
     require_role('librarian');
+    ensure_app_schema();
     if (isset($_POST['loan_id'])) {
         $loanId = (int) post('loan_id');
         $stmt = db()->prepare('SELECT * FROM loans WHERE id = ?');
@@ -1622,7 +1757,7 @@ function returns(): void
     }
 
     update_overdue_loans();
-    $loans = db()->query("SELECT loans.*, books.title, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id WHERE loans.status IN ('borrowed', 'overdue') ORDER BY loans.due_date")->fetchAll();
+    $loans = db()->query("SELECT loans.*, books.book_number, books.title, books.author, books.category, books.target_class, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id WHERE loans.status IN ('borrowed', 'overdue') ORDER BY loans.due_date")->fetchAll();
     page_header('Receive Returned Books');
     loans_table($loans, true);
     page_footer();
@@ -1630,8 +1765,9 @@ function returns(): void
 
 function overdue_loans(): array
 {
+    ensure_app_schema();
     update_overdue_loans();
-    return db()->query("SELECT loans.*, books.title, members.name AS member_name, members.phone AS member_phone, members.email AS member_email, users.email AS issued_by_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id LEFT JOIN users ON users.id = loans.issued_by WHERE loans.status = 'overdue' ORDER BY loans.due_date")->fetchAll();
+    return db()->query("SELECT loans.*, books.book_number, books.title, books.author, books.category, books.target_class, members.name AS member_name, members.phone AS member_phone, members.email AS member_email, users.email AS issued_by_email FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id LEFT JOIN users ON users.id = loans.issued_by WHERE loans.status = 'overdue' ORDER BY loans.due_date")->fetchAll();
 }
 
 function csv_value(?string $value): string
@@ -1663,7 +1799,7 @@ function export_overdue(): void
             csv_value(ucfirst($loan['borrower_type'] ?? 'student')),
             csv_value($loan['student_class'] ?? ''),
             csv_value($loan['student_stream'] ?? ''),
-            csv_value($loan['title']),
+            csv_value(book_display_label($loan)),
             csv_value($loan['issued_by_email'] ?? ''),
             (string) ($loan['copy_count'] ?? 1),
             csv_value($loan['issue_date']),
@@ -1707,7 +1843,7 @@ function loans_table(array $loans, bool $withReturn = false): void
             <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
             <?php foreach ($loans as $loan): ?>
                 <tr>
-                    <td class="px-4 py-3"><?= e($loan['title']) ?></td>
+                    <td class="px-4 py-3"><?= e(book_display_label($loan)) ?></td>
                     <td class="px-4 py-3"><?= e($loan['member_name']) ?></td>
                     <td class="px-4 py-3"><?= e($loan['student_class'] ?? '') ?></td>
                     <td class="px-4 py-3"><?= e($loan['student_stream'] ?? '') ?></td>
@@ -1736,13 +1872,14 @@ function loans_table(array $loans, bool $withReturn = false): void
 function fines(): void
 {
     require_role('librarian');
+    ensure_app_schema();
     if (isset($_POST['fine_id'])) {
         db()->prepare("UPDATE fines SET status = 'paid', paid_at = NOW() WHERE id = ?")->execute([(int) post('fine_id')]);
         flash('Fine marked as paid.');
         redirect('?action=fines');
     }
 
-    $fines = db()->query("SELECT fines.*, members.name AS member_name, books.title FROM fines JOIN members ON members.id = fines.member_id JOIN loans ON loans.id = fines.loan_id JOIN books ON books.id = loans.book_id ORDER BY fines.created_at DESC")->fetchAll();
+    $fines = db()->query("SELECT fines.*, books.id AS book_id, books.book_number, books.title, books.author, books.category, books.target_class, members.name AS member_name FROM fines JOIN members ON members.id = fines.member_id JOIN loans ON loans.id = fines.loan_id JOIN books ON books.id = loans.book_id ORDER BY fines.created_at DESC")->fetchAll();
     page_header('Fine Management');
     ?>
     <div class="overflow-x-auto rounded-md border bg-white">
@@ -1750,7 +1887,7 @@ function fines(): void
             <thead class="bg-zinc-50 text-zinc-500"><tr><th class="px-4 py-3">Member</th><th class="px-4 py-3">Book</th><th class="px-4 py-3">Amount</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Action</th></tr></thead>
             <tbody class="divide-y">
             <?php foreach ($fines as $fine): ?>
-                <tr><td class="px-4 py-3"><?= e($fine['member_name']) ?></td><td class="px-4 py-3"><?= e($fine['title']) ?></td><td class="px-4 py-3"><?= number_format((float) $fine['amount'], 2) ?></td><td class="px-4 py-3"><?= e($fine['status']) ?></td><td class="px-4 py-3"><?php if ($fine['status'] === 'unpaid'): ?><form method="post"><input type="hidden" name="fine_id" value="<?= e((string) $fine['id']) ?>"><button class="rounded-md primary-button px-3 py-1.5 text-white">Mark Paid</button></form><?php endif; ?></td></tr>
+                <tr><td class="px-4 py-3"><?= e($fine['member_name']) ?></td><td class="px-4 py-3"><?= e(book_display_label($fine)) ?></td><td class="px-4 py-3"><?= number_format((float) $fine['amount'], 2) ?></td><td class="px-4 py-3"><?= e($fine['status']) ?></td><td class="px-4 py-3"><?php if ($fine['status'] === 'unpaid'): ?><form method="post"><input type="hidden" name="fine_id" value="<?= e((string) $fine['id']) ?>"><button class="rounded-md primary-button px-3 py-1.5 text-white">Mark Paid</button></form><?php endif; ?></td></tr>
             <?php endforeach; ?>
             </tbody>
         </table>
@@ -1762,12 +1899,13 @@ function fines(): void
 function search_books(): void
 {
     require_login();
+    ensure_app_schema();
     $q = trim($_GET['q'] ?? '');
     $books = [];
     if ($q !== '') {
-        $stmt = db()->prepare('SELECT * FROM books WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ? OR category LIKE ? ORDER BY title');
+        $stmt = db()->prepare('SELECT * FROM books WHERE book_number LIKE ? OR title LIKE ? OR author LIKE ? OR isbn LIKE ? OR category LIKE ? OR target_class LIKE ? ORDER BY book_number, title, target_class');
         $like = '%' . $q . '%';
-        $stmt->execute([$like, $like, $like, $like]);
+        $stmt->execute([$like, $like, $like, $like, $like, $like]);
         $books = $stmt->fetchAll();
     }
 
@@ -1775,7 +1913,7 @@ function search_books(): void
     ?>
     <form class="mb-5 flex max-w-2xl gap-3">
         <input type="hidden" name="action" value="search">
-        <input name="q" value="<?= e($q) ?>" placeholder="Search by title, author, ISBN, or category" class="flex-1 rounded-md border px-3 py-2">
+        <input name="q" value="<?= e($q) ?>" placeholder="Search by number, title, author, ISBN, category, or class" class="flex-1 rounded-md border px-3 py-2">
         <button class="icon-button rounded-md primary-button px-4 py-2 text-white">
             <span class="material-symbols-outlined text-[18px]">search</span>
             Search
@@ -1790,9 +1928,10 @@ function search_books(): void
 function reports(bool $dailyOnly = false): void
 {
     require_login();
+    ensure_app_schema();
     $date = $_GET['date'] ?? date('Y-m-d');
     $where = $dailyOnly ? 'WHERE loans.issue_date = ? OR loans.return_date = ?' : '';
-    $stmt = db()->prepare("SELECT loans.*, books.title, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id $where ORDER BY loans.created_at DESC");
+    $stmt = db()->prepare("SELECT loans.*, books.book_number, books.title, books.author, books.category, books.target_class, members.name AS member_name FROM loans JOIN books ON books.id = loans.book_id JOIN members ON members.id = loans.member_id $where ORDER BY loans.created_at DESC");
     $dailyOnly ? $stmt->execute([$date, $date]) : $stmt->execute();
     $loans = $stmt->fetchAll();
     $fineTotal = db()->query("SELECT COALESCE(SUM(amount), 0) FROM fines")->fetchColumn();
@@ -1920,6 +2059,7 @@ try {
         'dashboard' => dashboard(),
         'librarians' => librarians(),
         'books' => books(),
+        'export_books' => export_books(),
         'members' => members(),
         'issue' => issue_book(),
         'returns' => returns(),

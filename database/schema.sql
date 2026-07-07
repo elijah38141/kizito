@@ -11,13 +11,17 @@ CREATE TABLE users (
 
 CREATE TABLE books (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    isbn VARCHAR(40) UNIQUE,
+    book_number VARCHAR(40) UNIQUE,
+    isbn VARCHAR(40),
     title VARCHAR(180) NOT NULL,
     author VARCHAR(160) NOT NULL,
     category VARCHAR(100) NOT NULL,
+    target_class VARCHAR(20) NOT NULL DEFAULT 'General',
     publisher VARCHAR(140),
     publication_year YEAR,
     shelf_location VARCHAR(60),
+    teacher_copies INT NOT NULL DEFAULT 0,
+    student_copies INT NOT NULL DEFAULT 0,
     total_copies INT NOT NULL DEFAULT 1,
     available_copies INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -101,7 +105,7 @@ INSERT INTO settings (setting_key, setting_value) VALUES
 ('student_streams_s1_s4', 'A, B'),
 ('daily_fine_rate', '500');
 
-INSERT INTO books (isbn, title, author, category, publisher, publication_year, shelf_location, total_copies, available_copies) VALUES
-('9780131103627', 'The C Programming Language', 'Brian W. Kernighan, Dennis M. Ritchie', 'Programming', 'Prentice Hall', 1988, 'A1', 3, 3),
-('9780132350884', 'Clean Code', 'Robert C. Martin', 'Programming', 'Prentice Hall', 2008, 'A2', 2, 2),
-('9780140449136', 'The Odyssey', 'Homer', 'Literature', 'Penguin Classics', 2003, 'B1', 4, 4);
+INSERT INTO books (book_number, isbn, title, author, category, target_class, publisher, publication_year, shelf_location, teacher_copies, student_copies, total_copies, available_copies) VALUES
+('BK-000001', '9780131103627', 'The C Programming Language', 'Brian W. Kernighan, Dennis M. Ritchie', 'Programming', 'General', 'Prentice Hall', 1988, 'A1', 1, 2, 3, 3),
+('BK-000002', '9780132350884', 'Clean Code', 'Robert C. Martin', 'Programming', 'General', 'Prentice Hall', 2008, 'A2', 1, 1, 2, 2),
+('BK-000003', '9780140449136', 'The Odyssey', 'Homer', 'Literature', 'General', 'Penguin Classics', 2003, 'B1', 1, 3, 4, 4);
